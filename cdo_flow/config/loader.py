@@ -44,6 +44,9 @@ def load_workflow_from_string(content: str):
         cdo_options=schema.cdo_options,
         keep_intermediates=schema.keep_intermediates,
         tags=schema.tags,
+        declared_inputs=schema.inputs,
+        output_path=schema.output_path,
+        params=schema.params,
     )
 
     for step_schema in schema.steps:

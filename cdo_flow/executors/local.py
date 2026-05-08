@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import multiprocessing
 import subprocess
+import sys
+import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from rich.console import Console
+from rich.live import Live
 from rich.table import Table
 
 from cdo_flow.dag import (
@@ -18,6 +22,7 @@ from cdo_flow.dag import (
     get_ready_steps,
     topological_sort,
 )
+from cdo_flow.events import StepEvent
 from cdo_flow.exceptions import InputFileNotFoundError, StepExecutionError
 from cdo_flow.executors.base import BaseExecutor
 from cdo_flow.provenance import ProvenanceBuilder, RunDirectory
@@ -186,6 +191,53 @@ def _resolve_step_inputs(
     return resolved
 
 
+# ── Live table helpers ──────────────────────────────────────────────────────
+
+_STATE_COLORS = {
+    "DONE": "green",
+    "FAILED": "red",
+    "SKIPPED": "yellow",
+    "RUNNING": "blue",
+    "PENDING": "dim",
+}
+
+
+class _LiveTableState:
+    """Tracks step states for the Rich live progress table."""
+
+    def __init__(self, workflow_name: str, steps: list[BaseStep]) -> None:
+        self._workflow_name = workflow_name
+        self._steps = steps
+        self._states: dict[str, str] = {s.name: "PENDING" for s in steps}
+        self._durations: dict[str, str] = {s.name: "-" for s in steps}
+        self._start_times: dict[str, datetime] = {}
+
+    def handle_event(self, event: StepEvent) -> None:
+        name = event.step_name
+        self._states[name] = event.state.value
+        if event.type == "step_started":
+            self._start_times[name] = event.timestamp
+        elif event.duration_seconds is not None:
+            self._durations[name] = f"{event.duration_seconds:.1f}s"
+
+    def render(self) -> Table:
+        table = Table(
+            "Step", "Status", "Duration",
+            title=f"[bold blue]{self._workflow_name}[/bold blue]",
+        )
+        for step in self._steps:
+            state = self._states.get(step.name, "PENDING")
+            dur = self._durations.get(step.name, "-")
+            if state == "RUNNING" and step.name in self._start_times:
+                elapsed = (datetime.now(timezone.utc) - self._start_times[step.name]).total_seconds()
+                dur = f"{elapsed:.1f}s"
+            color = _STATE_COLORS.get(state, "white")
+            table.add_row(step.name, f"[{color}]{state}[/{color}]", dur)
+        return table
+
+
+# ── Executor ────────────────────────────────────────────────────────────────
+
 class LocalExecutor(BaseExecutor):
     def validate(self, workflow: Workflow) -> list[str]:
         return workflow.validate()
@@ -197,6 +249,8 @@ class LocalExecutor(BaseExecutor):
         params: dict,
         run_id: str | None = None,
         max_workers: int | None = None,
+        on_event: Callable[[StepEvent], None] | None = None,
+        show_progress: bool = True,
     ) -> WorkflowResult:
         from cdo_flow.workflow import WorkflowResult
 
@@ -219,129 +273,208 @@ class LocalExecutor(BaseExecutor):
         completed: set[str] = set()
         running: set[str] = set()
         failed_or_skipped: set[str] = set()
+        step_start_times: dict[str, datetime] = {}
+
+        # Set up live table if requested
+        use_live = show_progress and sys.stdout.isatty()
+        live_state = _LiveTableState(workflow.name, steps) if use_live else None
+
+        def emit(event: StepEvent) -> None:
+            if live_state is not None:
+                live_state.handle_event(event)
+                if live is not None:
+                    live.update(live_state.render())
+            if on_event is not None:
+                on_event(event)
 
         console = Console()
-        console.print(f"\n[bold blue]Running workflow:[/bold blue] {workflow.name}")
+        if not use_live:
+            console.print(f"\n[bold blue]Running workflow:[/bold blue] {workflow.name}")
 
         futures: dict[Any, str] = {}
+        live = None  # will be set inside the context manager below
 
-        with ProcessPoolExecutor(max_workers=max_workers) as pool:
-            while True:
-                # Submit ready steps
-                ready = get_ready_steps(steps, deps, completed, running, failed_or_skipped)
-                for step in ready:
-                    try:
-                        resolved_inputs = _resolve_step_inputs(step, execution_state, inputs)
-                    except Exception as e:
-                        prov.record_step_failed(step.name, str(e))
-                        failed_or_skipped.add(step.name)
-                        for ds in get_downstream_steps(step.name, deps):
-                            prov.record_step_skipped(ds)
-                            failed_or_skipped.add(ds)
-                        continue
-
-                    keep = step.keep if step.keep is not None else workflow.keep_intermediates
-                    ctx = StepContext(
-                        inputs=resolved_inputs,
-                        run_dir=run_dir.path,
-                        step_name=step.name,
-                        workflow_name=workflow.name,
-                        params=params,
-                        _keep=keep,
-                    )
-
-                    prov.record_step_start(step.name)
-                    future = pool.submit(execute_step, step, ctx, workflow.cdo_options)
-                    futures[future] = step.name
-                    running.add(step.name)
-
-                # Collect completed futures (with short timeout to allow re-checking ready)
-                if not futures:
-                    # Check if there's anything left to do
-                    all_names = {s.name for s in steps}
-                    terminal = completed | failed_or_skipped
-                    remaining = all_names - terminal
-                    if not remaining:
-                        break
-                    # Check for steps that can never be ready (deps failed)
-                    for step in steps:
-                        if step.name not in terminal:
-                            if deps[step.name].intersection(failed_or_skipped):
-                                prov.record_step_skipped(step.name)
-                                failed_or_skipped.add(step.name)
-                    all_names = {s.name for s in steps}
-                    if all_names.issubset(completed | failed_or_skipped):
-                        break
-                    # If nothing is running and nothing is ready, we're stuck
-                    new_ready = get_ready_steps(steps, deps, completed, running, failed_or_skipped)
-                    if not new_ready:
-                        break
-                    continue
-
-                done_futures = []
-                for future in list(futures):
-                    if future.done():
-                        done_futures.append(future)
-
-                if not done_futures:
-                    # Wait for any future to complete
-                    import time
-                    time.sleep(0.05)
-                    continue
-
-                for future in done_futures:
-                    step_name = futures.pop(future)
-                    running.discard(step_name)
-                    exc = future.exception()
-                    if exc is not None:
-                        completed_record = StepExecutionRecord(
-                            step_name=step_name,
-                            state=StepState.FAILED,
-                            error=str(exc),
-                        )
-                        if isinstance(exc, StepExecutionError):
-                            completed_record.command = exc.command
-                            completed_record.exit_code = exc.returncode
-                            completed_record.stdout = exc.stdout
-                            completed_record.stderr = exc.stderr
-                        execution_state[step_name] = completed_record
-                        failed_or_skipped.add(step_name)
-                        prov.record_step_failed(
-                            step_name,
-                            str(exc),
-                            command=getattr(exc, "command", None),
-                            exit_code=getattr(exc, "returncode", None),
-                            stdout=getattr(exc, "stdout", None),
-                            stderr=getattr(exc, "stderr", None),
-                        )
-                        # Mark all downstream as skipped
-                        for ds in get_downstream_steps(step_name, deps):
-                            if ds not in failed_or_skipped and ds not in completed:
+        def _run_loop() -> None:
+            nonlocal live
+            _mp_ctx = multiprocessing.get_context("spawn")
+            with ProcessPoolExecutor(max_workers=max_workers, mp_context=_mp_ctx) as pool:
+                while True:
+                    # Submit ready steps
+                    ready = get_ready_steps(steps, deps, completed, running, failed_or_skipped)
+                    for step in ready:
+                        try:
+                            resolved_inputs = _resolve_step_inputs(step, execution_state, inputs)
+                        except Exception as e:
+                            prov.record_step_failed(step.name, str(e))
+                            failed_or_skipped.add(step.name)
+                            emit(StepEvent(
+                                type="step_failed",
+                                step_name=step.name,
+                                state=StepState.FAILED,
+                                error=str(e),
+                            ))
+                            for ds in get_downstream_steps(step.name, deps):
                                 prov.record_step_skipped(ds)
                                 failed_or_skipped.add(ds)
-                    else:
-                        record = future.result()
-                        execution_state[step_name] = record
-                        completed.add(step_name)
-                        prov.record_step_done(
-                            step_name,
-                            record.outputs,
-                            command=record.command,
-                            exit_code=record.exit_code,
-                            stdout=record.stdout,
-                            stderr=record.stderr,
+                                emit(StepEvent(
+                                    type="step_skipped",
+                                    step_name=ds,
+                                    state=StepState.SKIPPED,
+                                ))
+                            continue
+
+                        keep = step.keep if step.keep is not None else workflow.keep_intermediates
+                        effective_params = {**workflow.params, **params}
+                        ctx = StepContext(
+                            inputs=resolved_inputs,
+                            run_dir=run_dir.path,
+                            step_name=step.name,
+                            workflow_name=workflow.name,
+                            params=effective_params,
+                            _keep=keep,
                         )
-                        # Cleanup temp dirs for keep=False steps when all consumers done
-                        step_obj = next(s for s in steps if s.name == step_name)
-                        if not (step_obj.keep if step_obj.keep is not None else workflow.keep_intermediates):
-                            consumers = get_downstream_steps(step_name, deps)
-                            if consumers.issubset(completed | failed_or_skipped):
-                                run_dir.cleanup_temp_dir(step_name)
+
+                        prov.record_step_start(step.name)
+                        step_start_times[step.name] = datetime.now(timezone.utc)
+                        future = pool.submit(execute_step, step, ctx, workflow.cdo_options)
+                        futures[future] = step.name
+                        running.add(step.name)
+                        emit(StepEvent(
+                            type="step_started",
+                            step_name=step.name,
+                            state=StepState.RUNNING,
+                        ))
+
+                    # Collect completed futures
+                    if not futures:
+                        all_names = {s.name for s in steps}
+                        terminal = completed | failed_or_skipped
+                        remaining = all_names - terminal
+                        if not remaining:
+                            break
+                        for step in steps:
+                            if step.name not in terminal:
+                                if deps[step.name].intersection(failed_or_skipped):
+                                    prov.record_step_skipped(step.name)
+                                    failed_or_skipped.add(step.name)
+                                    emit(StepEvent(
+                                        type="step_skipped",
+                                        step_name=step.name,
+                                        state=StepState.SKIPPED,
+                                    ))
+                        if all_names.issubset(completed | failed_or_skipped):
+                            break
+                        new_ready = get_ready_steps(steps, deps, completed, running, failed_or_skipped)
+                        if not new_ready:
+                            break
+                        continue
+
+                    done_futures = [f for f in list(futures) if f.done()]
+                    if not done_futures:
+                        time.sleep(0.05)
+                        continue
+
+                    for future in done_futures:
+                        step_name = futures.pop(future)
+                        running.discard(step_name)
+                        started_at = step_start_times.get(step_name)
+                        duration = (
+                            (datetime.now(timezone.utc) - started_at).total_seconds()
+                            if started_at else None
+                        )
+                        exc = future.exception()
+                        if exc is not None:
+                            completed_record = StepExecutionRecord(
+                                step_name=step_name,
+                                state=StepState.FAILED,
+                                error=str(exc),
+                            )
+                            if isinstance(exc, StepExecutionError):
+                                completed_record.command = exc.command
+                                completed_record.exit_code = exc.returncode
+                                completed_record.stdout = exc.stdout
+                                completed_record.stderr = exc.stderr
+                            execution_state[step_name] = completed_record
+                            failed_or_skipped.add(step_name)
+                            prov.record_step_failed(
+                                step_name,
+                                str(exc),
+                                command=getattr(exc, "command", None),
+                                exit_code=getattr(exc, "returncode", None),
+                                stdout=getattr(exc, "stdout", None),
+                                stderr=getattr(exc, "stderr", None),
+                            )
+                            emit(StepEvent(
+                                type="step_failed",
+                                step_name=step_name,
+                                state=StepState.FAILED,
+                                duration_seconds=duration,
+                                error=str(exc),
+                                command=getattr(exc, "command", None),
+                            ))
+                            for ds in get_downstream_steps(step_name, deps):
+                                if ds not in failed_or_skipped and ds not in completed:
+                                    prov.record_step_skipped(ds)
+                                    failed_or_skipped.add(ds)
+                                    emit(StepEvent(
+                                        type="step_skipped",
+                                        step_name=ds,
+                                        state=StepState.SKIPPED,
+                                    ))
+                        else:
+                            record = future.result()
+                            execution_state[step_name] = record
+                            completed.add(step_name)
+                            prov.record_step_done(
+                                step_name,
+                                record.outputs,
+                                command=record.command,
+                                exit_code=record.exit_code,
+                                stdout=record.stdout,
+                                stderr=record.stderr,
+                            )
+                            emit(StepEvent(
+                                type="step_done",
+                                step_name=step_name,
+                                state=StepState.DONE,
+                                duration_seconds=duration,
+                                outputs={k: str(v) for k, v in record.outputs.items()},
+                                command=record.command,
+                            ))
+                            # Cleanup temp dirs for keep=False steps when all consumers done
+                            step_obj = next(s for s in steps if s.name == step_name)
+                            if not (step_obj.keep if step_obj.keep is not None else workflow.keep_intermediates):
+                                consumers = get_downstream_steps(step_name, deps)
+                                if consumers.issubset(completed | failed_or_skipped):
+                                    rec = execution_state.get(step_name)
+                                    if rec and rec.outputs:
+                                        first_path = next(
+                                            (v for k, v in rec.outputs.items() if k != "output"),
+                                            next(iter(rec.outputs.values()), None),
+                                        )
+                                        if first_path and isinstance(first_path, Path):
+                                            import shutil
+                                            temp_dir = first_path.parent
+                                            if not str(temp_dir).startswith(str(run_dir.path)):
+                                                shutil.rmtree(str(temp_dir), ignore_errors=True)
+
+        if use_live and live_state is not None:
+            with Live(live_state.render(), console=console, refresh_per_second=4) as _live:
+                live = _live
+                _run_loop()
+        else:
+            _run_loop()
 
         # Determine final status
         all_names = {s.name for s in steps}
-        failed_names = [n for n in all_names if execution_state.get(n, StepExecutionRecord(n)).state == StepState.FAILED]
-        skipped_names = [n for n in all_names if n in failed_or_skipped and n not in {n2 for n2 in failed_names}]
+        failed_names = [
+            n for n in all_names
+            if execution_state.get(n, StepExecutionRecord(n)).state == StepState.FAILED
+        ]
+        skipped_names = [
+            n for n in all_names
+            if n in failed_or_skipped and n not in set(failed_names)
+        ]
         status = "SUCCESS" if not failed_names else "FAILED"
 
         # Collect leaf outputs
@@ -354,30 +487,38 @@ class LocalExecutor(BaseExecutor):
         prov_data = prov.build(status)
         run_dir.write_provenance(prov_data)
 
-        # Print summary table
-        table = Table("Step", "Status", "Duration", title=f"Workflow Summary: {workflow.name}")
-        for step in steps:
-            rec = execution_state.get(step.name)
-            if rec:
-                state_str = rec.state.value if hasattr(rec.state, "value") else str(rec.state)
-                if rec.start_time and rec.end_time:
-                    from datetime import datetime
-                    try:
-                        start = datetime.fromisoformat(rec.start_time)
-                        end = datetime.fromisoformat(rec.end_time)
-                        dur = f"{(end - start).total_seconds():.2f}s"
-                    except Exception:
+        # Copy leaf output to workflow.output_path if configured
+        copied_output_path: Path | None = None
+        if workflow.output_path is not None and status == "SUCCESS" and result_outputs:
+            import shutil
+            dest = workflow.output_path
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            src = next(iter(result_outputs.values()))
+            shutil.copy2(str(src), str(dest))
+            copied_output_path = dest
+
+        # Print final summary table (no-live path) or a static table after Live exits
+        if not use_live:
+            table = Table("Step", "Status", "Duration", title=f"Workflow Summary: {workflow.name}")
+            for step in steps:
+                rec = execution_state.get(step.name)
+                if rec:
+                    state_str = rec.state.value if hasattr(rec.state, "value") else str(rec.state)
+                    if rec.start_time and rec.end_time:
+                        try:
+                            start = datetime.fromisoformat(rec.start_time)
+                            end = datetime.fromisoformat(rec.end_time)
+                            dur = f"{(end - start).total_seconds():.2f}s"
+                        except Exception:
+                            dur = "-"
+                    else:
                         dur = "-"
                 else:
+                    state_str = StepState.SKIPPED.value
                     dur = "-"
-            else:
-                state_str = StepState.SKIPPED.value
-                dur = "-"
-
-            color = {"DONE": "green", "FAILED": "red", "SKIPPED": "yellow"}.get(state_str, "white")
-            table.add_row(step.name, f"[{color}]{state_str}[/{color}]", dur)
-
-        console.print(table)
+                color = _STATE_COLORS.get(state_str, "white")
+                table.add_row(step.name, f"[{color}]{state_str}[/{color}]", dur)
+            console.print(table)
 
         return WorkflowResult(
             status=status,
@@ -386,4 +527,5 @@ class LocalExecutor(BaseExecutor):
             run_dir=run_dir.path,
             failed_steps=failed_names,
             skipped_steps=skipped_names,
+            output_path=copied_output_path,
         )

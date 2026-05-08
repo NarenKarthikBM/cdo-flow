@@ -47,6 +47,9 @@ class WorkflowSchema(BaseModel):
     keep_intermediates: bool = True
     cdo_options: dict[str, Any] = {}
     tags: list[str] = []
+    inputs: list[str] = []
+    output_path: str | None = None
+    params: dict[str, Any] = {}
     steps: list[StepSchema]
 
     @field_validator("steps")

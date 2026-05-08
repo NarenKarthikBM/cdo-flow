@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cdo-flow"
-version = "0.1.0"
+version = "0.2.0"
 description = "Workflow orchestration layer for CDO-based climate analysis"
 readme = "README.md"
 license = { text = "MIT" }
@@ -27,6 +27,7 @@ dependencies = [
     "rich>=13.0",
     "click>=8.0",
     "pydantic>=2.0",
+    "textual>=0.50",
 ]
 
 [project.optional-dependencies]
