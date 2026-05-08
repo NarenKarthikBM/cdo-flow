@@ -13,3 +13,6 @@ build/
 .ruff_cache/
 runs/
 *.nc
+.DS_Store
+*.log
+PRODUCT_CONCEPT.md
