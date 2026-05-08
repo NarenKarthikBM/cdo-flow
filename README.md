@@ -4,6 +4,23 @@ Workflow orchestration layer for CDO-based climate analysis, built on [python-cd
 
 Define multi-step processing pipelines in Python or YAML, run them in parallel with dependency tracking, inspect provenance, and explore results in an interactive TUI — all on top of CDO.
 
+## Why cdo-flow?
+
+![Manual CDO vs cdo-flow](docs/comparison.svg)
+
+**Without cdo-flow** - you write each CDO command by hand, pipe outputs into new files and run everything one step at a time:
+- Every step must be typed and executed individually in the terminal
+- Intermediate files (`tas.nc`, `sub.nc`, `annual.nc`) must be named and tracked by hand
+- If a step fails, there is no record of what ran, you debug from bash history
+- Sharing or re-running the pipeline means handing someone a list of commands
+
+**With cdo-flow** - you describe the pipeline once and run it with a single command:
+- All steps are declared in a `workflow.yml` (or as Python decorators) and version-controlled alongside your code
+- Input files are passed at runtime; cdo-flow wires them through the pipeline automatically
+- Independent steps run in parallel; a live progress display shows what is running and what finished
+- Temp files are handled at each step; users can define whether to keep them or delete them in the workflows
+- Every run produces a `provenance.json` capturing the exact commands, timing, exit codes and output paths
+
 ## Install
 
 ```bash
