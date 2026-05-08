@@ -1,0 +1,22 @@
+name: sample_workflow
+description: A sample CDO workflow for testing
+run_dir: ./runs
+
+steps:
+  - id: select_var
+    type: cdo
+    inputs:
+      data: /path/to/input.nc
+    operator_chain:
+      - op: selname
+        args: [tas]
+    output: tas.nc
+
+  - id: year_mean
+    type: cdo
+    inputs:
+      data: "@select_var.output"
+    operator_chain:
+      - op: yearmean
+    output: tas_annual.nc
+    depends_on: [select_var]
